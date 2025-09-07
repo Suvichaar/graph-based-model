@@ -1,0 +1,10 @@
+streamlit
+pillow
+requests
+boto3
+azure-ai-documentintelligence
+azure-cognitiveservices-speech
+openai
+matplotlib
+python-docx
+imageio 
