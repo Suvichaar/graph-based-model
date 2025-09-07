@@ -1,27 +1,3 @@
-# streamlit_prompt_to_graph_and_gif.py
-# -------------------------------------------------------------
-# Streamlit app:
-# 1) Prompt → Static Graph (PNG)
-# 2) Prompt → Animated GIF  (dynamic y(x,t) or a trace reveal of y(x))
-#    + optional S3 upload to get a public URL
-#
-# Secrets required (in .streamlit/secrets.toml):
-#   # Azure OpenAI (optional; regex fallback if missing)
-#   AZURE_API_KEY="YOUR_API_KEY"
-#   AZURE_ENDPOINT="https://YOUR-RESOURCE-NAME.cognitiveservices.azure.com"
-#   AZURE_DEPLOYMENT="gpt-5-chat"
-#   AZURE_API_VERSION="2025-01-01-preview"
-#
-#   # AWS / S3 (optional; only needed for upload)
-#   AWS_ACCESS_KEY="YOUR_AWS_ACCESS_KEY_ID"
-#   AWS_SECRET_KEY="YOUR_AWS_SECRET_ACCESS_KEY"
-#   AWS_REGION="ap-south-1"
-#   AWS_BUCKET="suvichaarapp"
-#   S3_PREFIX="media"
-#   # Optional CDN:
-#   CDN_PREFIX_MEDIA="https://media.suvichaar.org/"
-# -------------------------------------------------------------
-
 import io
 import os
 import re
@@ -180,12 +156,24 @@ GPT_USER_TEMPLATE = (
 
 _re_num = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
 
-def _strip_trailing_range_phrases(s: str) -> str:
-    s = re.sub(r"\bfrom\b.+$", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bbetween\b.+$", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bfor\s*t?\s*in\b.+$", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bon\s*\[.*?\]|\bon\s*\(.*?\)", "", s, flags=re.IGNORECASE)
-    return s.strip(" ;,")
+def _strip_range_phrases_anywhere(s: str) -> str:
+    """Remove range/interval phrases anywhere in the expression."""
+    # 1) Remove 'for <var> in [a,b]' or '(a,b)'
+    s = re.sub(r"\bfor\s*[a-zA-Z]\s*in\s*[\(\[][^\)\]]*[\)\]]", "", s, flags=re.IGNORECASE)
+
+    # 2) Remove '<var> from A to B' or 'from A to B' (no var)
+    s = re.sub(r"\b[xt]\s*from\s*[^,;]+?\s*to\s*[^,;]+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bfrom\s*[^,;]+?\s*to\s*[^,;]+", "", s, flags=re.IGNORECASE)
+
+    # 3) Remove 'between A and B'
+    s = re.sub(r"\bbetween\s*[^,;]+?\s*and\s*[^,;]+", "", s, flags=re.IGNORECASE)
+
+    # 4) Remove 'on [a,b]' or '(a,b)'
+    s = re.sub(r"\bon\s*[\(\[][^\)\]]*[\)\]]", "", s, flags=re.IGNORECASE)
+
+    # 5) Clean leftover commas/semicolons/extra spaces
+    s = re.sub(r"\s*[,;]\s*$", "", s).strip(" ,;")
+    return s
 
 def sanitize_equation(eq: str) -> str:
     s = (eq or "").strip()
@@ -193,7 +181,7 @@ def sanitize_equation(eq: str) -> str:
         rhs = s.split("=", 1)[1]
     else:
         rhs = s
-    rhs = _strip_trailing_range_phrases(rhs)
+    rhs = _strip_range_phrases_anywhere(rhs)
     return f"y = {rhs}"
 
 def _parse_num_token(tok: Optional[str]) -> Optional[float]:
@@ -306,18 +294,26 @@ def to_numpy_expr(equation: str) -> str:
     s = equation.strip()
     if re.match(r"^y\s*=", s, flags=re.I):
         s = s.split("=", 1)[1]
-    s = _strip_trailing_range_phrases(s)
+
+    # Remove any range/interval chatter *anywhere*
+    s = _strip_range_phrases_anywhere(s)
+
     # Normalizations (unicode + math)
     s = (s.replace("π", "pi").replace("·", "*").replace("√", "sqrt")
            .replace("^", "**").replace("ln", "log")
            .replace("²", "**2").replace("³", "**3"))
-    # implicit multiplication: 2x, 2t, 2(x+1)
-    s = re.sub(r"(?<=\d)\s*(?=x)", "*", s)
-    s = re.sub(r"(?<=\d)\s*(?=t)", "*", s)
-    s = re.sub(r"(?<=\d)\s*\(", "*(", s)
+
+    # Implicit multiplication fixes
+    s = re.sub(r"(?<=\d)\s*(?=x)", "*", s)        # 2x -> 2*x
+    s = re.sub(r"(?<=\d)\s*(?=t)", "*", s)        # 2t -> 2*t
+    s = re.sub(r"(?<=\d)\s*(?=pi\b)", "*", s)     # 2pi -> 2*pi
+    s = re.sub(r"\bpi\s*(?=[xt])", "pi*", s)      # pi x -> pi*x, pi t -> pi*t
+    s = re.sub(r"(?<=\d)\s*\(", "*(", s)          # 2(x+1) -> 2*(x+1)
+
     # Abs shorthand
     s = s.replace("|x|", "abs(x)")
     return s
+
 
 def eval_expression(expr: str, x: np.ndarray, t: float = 0.0) -> np.ndarray:
     env = {
