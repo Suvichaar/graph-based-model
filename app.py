@@ -1,10 +1,26 @@
-# streamlit_graph_from_prompt.py
-# -----------------------------------------------
+# streamlit_prompt_to_graph_and_gif.py
+# -------------------------------------------------------------
 # Streamlit app:
-# 1) Prompt → Graph (static PNG) with optional Azure GPT extraction
-# 2) Heat Conduction (Fourier vs. Non-Fourier) → Animated GIF
-#    + Upload GIF to S3 and return a viewable URL
-# -----------------------------------------------
+# 1) Prompt → Static Graph (PNG)
+# 2) Prompt → Animated GIF  (dynamic y(x,t) or a trace reveal of y(x))
+#    + optional S3 upload to get a public URL
+#
+# Secrets required (in .streamlit/secrets.toml):
+#   # Azure OpenAI (optional; regex fallback if missing)
+#   AZURE_API_KEY="YOUR_API_KEY"
+#   AZURE_ENDPOINT="https://YOUR-RESOURCE-NAME.cognitiveservices.azure.com"
+#   AZURE_DEPLOYMENT="gpt-5-chat"
+#   AZURE_API_VERSION="2025-01-01-preview"
+#
+#   # AWS / S3 (optional; only needed for upload)
+#   AWS_ACCESS_KEY="YOUR_AWS_ACCESS_KEY_ID"
+#   AWS_SECRET_KEY="YOUR_AWS_SECRET_ACCESS_KEY"
+#   AWS_REGION="ap-south-1"
+#   AWS_BUCKET="suvichaarapp"
+#   S3_PREFIX="media"
+#   # Optional CDN:
+#   CDN_PREFIX_MEDIA="https://media.suvichaar.org/"
+# -------------------------------------------------------------
 
 import io
 import os
@@ -14,7 +30,7 @@ import json
 import time
 import tempfile
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import streamlit as st
@@ -35,15 +51,15 @@ except Exception:
 # =========================
 # Page UI
 # =========================
-st.set_page_config(page_title="Prompt → Graph + GIF to S3", page_icon="📈", layout="wide")
-st.title("📈 Prompt → Graph  •  🎞️ Heat Conduction GIF → S3")
-st.caption("Type a math request (e.g., “Plot y = sin(x) from −2π to 2π”). "
-           "Optionally use Azure OpenAI to extract the equation and range. "
-           "You can also generate the Fourier vs. Non-Fourier heat conduction GIF and upload it to S3.")
+st.set_page_config(page_title="Prompt → Graph + GIF (to S3)", page_icon="📈", layout="wide")
+st.title("📈 Prompt → Graph  •  🎞️ Prompt → GIF (S3 upload optional)")
+st.caption("Describe a function like “plot y = x^2 - 1 from -5 to 5” (PNG) or "
+           "“animate y = sin(x - 0.5 t) for x in [-2π,2π], t from 0 to 12” (GIF). "
+           "Azure GPT extraction is optional; robust regex fallback is built-in.")
 
 
 # =========================
-# Secrets Helpers
+# Secrets helpers
 # =========================
 def read_azure_config() -> dict:
     return {
@@ -60,24 +76,24 @@ def read_aws_config() -> dict:
         "region": st.secrets.get("AWS_REGION", "us-east-1"),
         "bucket": st.secrets.get("AWS_BUCKET"),
         "prefix": (st.secrets.get("S3_PREFIX") or "media").strip("/"),
-        "cdn_media": st.secrets.get("CDN_PREFIX_MEDIA"),   # e.g., https://media.example.com/
-        "cdn_html": st.secrets.get("CDN_HTML_BASE"),       # fallback CDN base if desired
+        "cdn_media": st.secrets.get("CDN_PREFIX_MEDIA"),
+        "cdn_html": st.secrets.get("CDN_HTML_BASE"),
     }
-
 
 AZURE_CFG = read_azure_config()
 AWS_CFG = read_aws_config()
 
 
 # =========================
-# Azure client (optional)
+# Optional Azure client
 # =========================
 def get_azure_client():
     if AzureOpenAI is None:
-        st.info("AzureOpenAI SDK not installed (pip install openai>=1.13.3). Falling back to regex extractor.")
+        st.info("AzureOpenAI SDK not installed (pip install openai>=1.13.3). Using regex extractor.")
         return None
-    if not all([AZURE_CFG.get("api_key"), AZURE_CFG.get("endpoint"), AZURE_CFG.get("deployment"), AZURE_CFG.get("version")]):
-        st.info("Azure config not found in .streamlit/secrets.toml. Using regex extractor.")
+    if not all([AZURE_CFG.get("api_key"), AZURE_CFG.get("endpoint"),
+                AZURE_CFG.get("deployment"), AZURE_CFG.get("version")]):
+        st.info("Azure secrets not found. Using regex extractor.")
         return None
     try:
         return AzureOpenAI(
@@ -86,56 +102,88 @@ def get_azure_client():
             api_version=AZURE_CFG["version"],
         )
     except Exception as e:
-        st.warning(f"Azure client init failed: {e}")
+        st.info(f"Azure client init failed; falling back to regex. ({e})")
         return None
 
 
 # =========================
-# Sidebar Controls
+# Sidebar controls
 # =========================
 with st.sidebar:
-    st.header("Static Graph (PNG)")
-    use_gpt = st.checkbox("Use Azure GPT to extract equation/range", value=True)
-    st.caption("If Azure secrets/SDK are missing, the app will use regex extraction.")
+    st.header("Options")
+    use_gpt = st.checkbox("Use Azure GPT to extract ranges", value=True)
+    st.caption("If secrets/SDK are missing or GPT fails, regex extraction is used.")
 
     st.markdown("---")
-    st.header("Heat Conduction GIF → S3")
-    frames = st.number_input("Frames", min_value=30, max_value=600, value=120, step=10)
-    fps = st.number_input("GIF FPS", min_value=5, max_value=60, value=15, step=1)
-    interval_ms = st.number_input("Preview interval (ms)", min_value=10, max_value=200, value=100, step=10)
-    # Model parameters (optional)
-    D = st.number_input("Diffusion width factor (D)", min_value=0.01, max_value=2.0, value=0.2, step=0.01, format="%.2f")
-    speed = st.number_input("Wave speed", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f")
-    wavelength = st.number_input("Cosine wavelength", min_value=0.5, max_value=20.0, value=3.0, step=0.5, format="%.1f")
-    sigma2 = st.number_input("Wave packet variance", min_value=0.2, max_value=10.0, value=2.0, step=0.2, format="%.1f")
+    st.subheader("GIF Options (from prompt)")
+    frames = st.number_input("Frames", min_value=20, max_value=1000, value=180, step=10)
+    fps = st.number_input("FPS", min_value=5, max_value=60, value=20, step=1)
+    points = st.number_input("x points", min_value=200, max_value=5000, value=1000, step=100)
+    st.caption("If your equation has no ‘t’, we animate a left→right reveal of the curve.")
+    st.markdown("---")
+    want_upload = st.checkbox("Upload GIF to S3", value=False)
+    st.caption("Requires AWS_* secrets; will return a public URL (or CDN if configured).")
 
 
 # =========================
-# Static Graph: Extraction helpers
+# Prompt inputs
+# =========================
+left, right = st.columns([1, 1])
+
+with left:
+    st.subheader("Prompt → Static Graph (PNG)")
+    prompt_png = st.text_area("Describe the function to plot (PNG)",
+                              value="Plot y = x^2 - 1 from -5 to 5",
+                              height=100)
+    c1, c2 = st.columns(2)
+    with c1:
+        override_xmin_png = st.text_input("x_min (optional)")
+    with c2:
+        override_xmax_png = st.text_input("x_max (optional)")
+
+with right:
+    st.subheader("Prompt → Animated GIF")
+    prompt_gif = st.text_area("Describe the function to animate (GIF)",
+                              value="Animate y = sin(x - 0.5 t) for x in [-2π, 2π], t from 0 to 12",
+                              height=100)
+    g1, g2 = st.columns(2)
+    with g1:
+        override_xmin_gif = st.text_input("GIF x_min (optional)")
+        override_tmin = st.text_input("t_min (optional)")
+    with g2:
+        override_xmax_gif = st.text_input("GIF x_max (optional)")
+        override_tmax = st.text_input("t_max (optional)")
+
+
+# =========================
+# Extraction helpers
 # =========================
 @dataclass
 class Extraction:
     equation: Optional[str]
     x_min: Optional[float]
     x_max: Optional[float]
+    t_min: Optional[float]
+    t_max: Optional[float]
     source: str  # "gpt" or "regex"
 
-
 GPT_SYSTEM = (
-    "You extract graphable equations from short prompts. "
-    "Return STRICT JSON (no prose) with keys: equation (string, like 'y = ...'), "
-    "x_min (number or null), x_max (number or null). The equation must be y as a function of x."
+    "Extract a graphable equation of y in terms of x, optionally depending on t."
+    " Respond as STRICT JSON (no prose) with EXACTLY these keys:"
+    ' {"equation":"y = ...","x_min":<number|null>,"x_max":<number|null>,"t_min":<number|null>,"t_max":<number|null>}.'
 )
 GPT_USER_TEMPLATE = (
     "Prompt:\n{prompt}\n\n"
-    "Return JSON like:\n"
-    "{\n  \"equation\": \"y = ...\",\n  \"x_min\": -10,\n  \"x_max\": 10\n}\n"
+    "Return exactly:\n"
+    '{ "equation": "y = ...", "x_min": -10, "x_max": 10, "t_min": 0, "t_max": 6.28 }\n'
 )
+
+_re_num = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
 
 def _strip_trailing_range_phrases(s: str) -> str:
     s = re.sub(r"\bfrom\b.+$", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bbetween\b.+$", "", s, flags=re.IGNORECASE)
-    s = re.sub(r"\bfor\s*x\s*in\b.+$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bfor\s*t?\s*in\b.+$", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\bon\s*\[.*?\]|\bon\s*\(.*?\)", "", s, flags=re.IGNORECASE)
     return s.strip(" ;,")
 
@@ -149,51 +197,68 @@ def sanitize_equation(eq: str) -> str:
     return f"y = {rhs}"
 
 def _parse_num_token(tok: Optional[str]) -> Optional[float]:
-    if tok is None:
-        return None
+    if tok is None: return None
     t = tok.strip().replace("π", "pi")
     try:
         return float(eval(t, {"__builtins__": {}}, {"pi": math.pi, "e": math.e}))
     except Exception:
         return None
 
-_re_num = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
+def _find_range(text: str, var: str) -> Tuple[Optional[float], Optional[float]]:
+    pat_num = rf"{var}\s*(?:from|=)\s*({_re_num})\s*(?:to|,)\s*({_re_num})"
+    m = re.search(pat_num, text, flags=re.IGNORECASE)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    # symbolic tokens (e.g., -2π to 2π)
+    m = re.search(rf"{var}\s*(?:from|=)\s*([^\s,;]+)\s*(?:to|,)\s*([^\s,;]+)", text, flags=re.IGNORECASE)
+    if m:
+        return _parse_num_token(m.group(1)), _parse_num_token(m.group(2))
+    # in [a,b]
+    m = re.search(rf"{var}\s*in\s*[\[\(]\s*([^\s,;]+)\s*,\s*([^\s,;]+)\s*[\]\)]", text, flags=re.IGNORECASE)
+    if m:
+        return _parse_num_token(m.group(1)), _parse_num_token(m.group(2))
+    return None, None
 
 def extract_with_regex(prompt_text: str) -> Extraction:
     text = prompt_text.strip()
+
+    # Equation (allow y=..., f(x)=..., y(x,t)=...)
     m = re.search(r"y\s*=\s*([^\n;]+)", text, flags=re.IGNORECASE)
     if m:
         eq = f"y = {m.group(1).strip()}"
     else:
-        m = re.search(r"f\s*\(\s*x\s*\)\s*=\s*([^\n;]+)", text, flags=re.IGNORECASE)
+        m = re.search(r"y\s*\(\s*x\s*(?:,\s*t\s*)?\)\s*=\s*([^\n;]+)", text, flags=re.IGNORECASE)
         if m:
             eq = f"y = {m.group(1).strip()}"
         else:
-            m = re.search(r"(?<![A-Za-z0-9_])(x[^\n;]+)", text)
-            eq = f"y = {m.group(1).strip()}" if m else None
+            m = re.search(r"f\s*\(\s*x\s*\)\s*=\s*([^\n;]+)", text, flags=re.IGNORECASE)
+            if m:
+                eq = f"y = {m.group(1).strip()}"
+            else:
+                # bare expression containing x (and maybe t)
+                m = re.search(r"(?<![A-Za-z0-9_])(x[^\n;]+)", text)
+                eq = f"y = {m.group(1).strip()}" if m else None
+
     eq = sanitize_equation(eq) if eq else None
 
-    x_min = x_max = None
-    m = re.search(rf"from\s*({_re_num})\s*to\s*({_re_num})", text, flags=re.IGNORECASE)
-    if m:
-        x_min, x_max = float(m.group(1)), float(m.group(2))
-    else:
-        m = re.search(rf"between\s*({_re_num})\s*and\s*({_re_num})", text, flags=re.IGNORECASE)
+    # x-range
+    x_min, x_max = _find_range(text, "x")
+    # fallback "from ... to ..." (no var) → treat as x-range
+    if x_min is None or x_max is None:
+        m = re.search(rf"from\s*({_re_num})\s*to\s*({_re_num})", text, flags=re.IGNORECASE)
         if m:
             x_min, x_max = float(m.group(1)), float(m.group(2))
         else:
             m = re.search(r"from\s*([^\s,;]+)\s*to\s*([^\s,;]+)", text, flags=re.IGNORECASE)
             if m:
-                x_min = _parse_num_token(m.group(1))
-                x_max = _parse_num_token(m.group(2))
-            else:
-                m = re.search(r"between\s*([^\s,;]+)\s*and\s*([^\s,;]+)", text, flags=re.IGNORECASE)
-                if m:
-                    x_min = _parse_num_token(m.group(1))
-                    x_max = _parse_num_token(m.group(2))
-    return Extraction(eq, x_min, x_max, "regex")
+                x_min, x_max = _parse_num_token(m.group(1)), _parse_num_token(m.group(2))
 
-def get_azure_extraction(prompt_text: str) -> Optional[Extraction]:
+    # t-range
+    t_min, t_max = _find_range(text, "t")
+
+    return Extraction(eq, x_min, x_max, t_min, t_max, "regex")
+
+def extract_with_gpt(prompt_text: str) -> Optional[Extraction]:
     client = get_azure_client()
     if client is None:
         return None
@@ -210,38 +275,54 @@ def get_azure_extraction(prompt_text: str) -> Optional[Extraction]:
                 {"role": "user", "content": GPT_USER_TEMPLATE.format(prompt=prompt_text.strip())},
             ],
         )
-        data = json.loads(resp.choices[0].message.content)
-        eq = sanitize_equation((data.get("equation") or "").strip())
-        x_min = data.get("x_min")
-        x_max = data.get("x_max")
-        return Extraction(eq or None,
-                          float(x_min) if x_min is not None else None,
-                          float(x_max) if x_max is not None else None,
-                          "gpt")
-    except Exception as e:
-        st.warning(f"Azure extraction failed: {e}")
+        raw = resp.choices[0].message.content
+        data = json.loads(raw or "{}")
+
+        eq = (data.get("equation") or data.get("Equation") or "").strip()
+        if not eq:
+            return None
+        eq = sanitize_equation(eq)
+
+        def _num(v): 
+            return float(v) if v is not None else None
+
+        return Extraction(
+            eq,
+            _num(data.get("x_min") if "x_min" in data else data.get("xMin")),
+            _num(data.get("x_max" ) if "x_max" in data else data.get("xMax")),
+            _num(data.get("t_min") if "t_min" in data else data.get("tMin")),
+            _num(data.get("t_max") if "t_max" in data else data.get("tMax")),
+            "gpt",
+        )
+    except Exception:
+        # Quietly fall back to regex
         return None
 
 
 # =========================
-# Static Graph: Expression → NumPy
+# Expr → NumPy
 # =========================
 def to_numpy_expr(equation: str) -> str:
     s = equation.strip()
     if re.match(r"^y\s*=", s, flags=re.I):
         s = s.split("=", 1)[1]
     s = _strip_trailing_range_phrases(s)
+    # Normalizations (unicode + math)
     s = (s.replace("π", "pi").replace("·", "*").replace("√", "sqrt")
            .replace("^", "**").replace("ln", "log")
            .replace("²", "**2").replace("³", "**3"))
-    s = re.sub(r"(?<=\d)\s*(?=x)", "*", s)   # 2x -> 2*x
-    s = re.sub(r"(?<=\d)\s*\(", "*(", s)     # 2(x+1) -> 2*(x+1)
+    # implicit multiplication: 2x, 2t, 2(x+1)
+    s = re.sub(r"(?<=\d)\s*(?=x)", "*", s)
+    s = re.sub(r"(?<=\d)\s*(?=t)", "*", s)
+    s = re.sub(r"(?<=\d)\s*\(", "*(", s)
+    # Abs shorthand
     s = s.replace("|x|", "abs(x)")
     return s
 
-def eval_expression(expr: str, x: np.ndarray) -> np.ndarray:
+def eval_expression(expr: str, x: np.ndarray, t: float = 0.0) -> np.ndarray:
     env = {
-        "x": x, "pi": np.pi, "e": np.e,
+        "x": x, "t": t,
+        "pi": np.pi, "e": np.e,
         "sin": np.sin, "cos": np.cos, "tan": np.tan,
         "sinh": np.sinh, "cosh": np.cosh, "tanh": np.tanh,
         "arcsin": np.arcsin, "arccos": np.arccos, "arctan": np.arctan,
@@ -252,6 +333,10 @@ def eval_expression(expr: str, x: np.ndarray) -> np.ndarray:
     y = np.where(np.isfinite(y), y, np.nan)
     return y
 
+
+# =========================
+# Static PNG
+# =========================
 def render_static_plot_png(equation: str, x_min: float, x_max: float, points: int) -> io.BytesIO:
     import matplotlib.pyplot as plt
     if x_max <= x_min:
@@ -273,46 +358,75 @@ def render_static_plot_png(equation: str, x_min: float, x_max: float, points: in
 
 
 # =========================
-# Heat Conduction GIF
+# Prompt → Animated GIF
 # =========================
-def build_heat_conduction_gif(frames=120, fps=15, interval_ms=100, L=10.0, N=400,
-                              D=0.2, speed=0.05, wavelength=3.0, sigma2=2.0) -> bytes:
+def _estimate_ylim(expr: str, x: np.ndarray, has_t: bool, t_min: float, t_max: float) -> Tuple[float, float]:
+    ys = []
+    if has_t:
+        for tau in np.linspace(t_min, t_max, 7):
+            ys.append(eval_expression(expr, x, t=tau))
+    else:
+        ys.append(eval_expression(expr, x, t=0.0))
+    ycat = np.concatenate(ys)
+    ycat = ycat[np.isfinite(ycat)]
+    if ycat.size == 0:
+        return -1.0, 1.0
+    lo, hi = np.nanpercentile(ycat, [5, 95])
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo, hi = np.min(ycat), np.max(ycat)
+    margin = 0.1 * (hi - lo + 1e-9)
+    return lo - margin, hi + margin
+
+def build_prompt_gif(equation: str, x_min: float, x_max: float, points: int,
+                     frames: int, fps: int, t_min: Optional[float], t_max: Optional[float]) -> bytes:
     import matplotlib.pyplot as plt
     import matplotlib.animation as animation
+    from matplotlib.animation import PillowWriter
 
-    x = np.linspace(0, L, N)
-    k = 2 * np.pi / wavelength
+    if x_max <= x_min:
+        raise ValueError("x_max must be greater than x_min")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
-    fig.suptitle("Heat Conduction: Fourier vs. Non-Fourier")
-    (line1,) = ax1.plot([], [], lw=2, color="red", label="Gaussian pulse")
-    (line2,) = ax2.plot([], [], lw=2, color="blue", label="Wave packet")
+    x = np.linspace(x_min, x_max, int(points))
+    expr = to_numpy_expr(equation)
+    has_t = "t" in expr
 
-    for ax, title in zip([ax1, ax2], ["Fourier (Diffusion)", "Non-Fourier (Wave-like)"]):
-        ax.set_xlim(0, L); ax.set_ylim(-1.0, 1.5)
-        ax.set_xlabel("Position"); ax.set_ylabel("Temperature")
-        ax.set_title(title); ax.legend(loc="upper right", frameon=False)
+    # Default t-range if equation uses t
+    if has_t:
+        t_min = -2*np.pi if t_min is None else float(t_min)
+        t_max =  2*np.pi if t_max is None else float(t_max)
+    else:
+        t_min = t_max = 0.0
+
+    # Prepare figure
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=150)
+    (line,) = ax.plot([], [], lw=2)
+    ax.axhline(0, lw=1); ax.axvline(0, lw=1); ax.grid(True)
+    ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_title(equation)
+
+    # Fix y-limits to avoid jitter
+    ylo, yhi = _estimate_ylim(expr, x, has_t, t_min, t_max)
+    ax.set_xlim(x_min, x_max); ax.set_ylim(ylo, yhi)
 
     def init():
-        line1.set_data(x, np.full_like(x, np.nan))
-        line2.set_data(x, np.full_like(x, np.nan))
-        return line1, line2
+        line.set_data([], [])
+        return (line,)
 
-    def animate(t):
-        width = 1.0 + D * t
-        y1 = np.exp(-((x - L/2) ** 2) / width) / np.sqrt(width)
-        center = L/2 + speed * t
-        y2 = np.exp(-((x - center) ** 2) / sigma2) * np.cos(k * (x - speed * t))
-        line1.set_data(x, y1); line2.set_data(x, y2)
-        return line1, line2
+    def animate(i):
+        if has_t:
+            tau = t_min + (t_max - t_min) * (i / (frames - 1))
+            y = eval_expression(expr, x, t=tau)
+            line.set_data(x, y)
+        else:
+            n = max(2, int(len(x) * (i + 1) / frames))
+            xx = x[:n]
+            yy = eval_expression(expr, xx, t=0.0)
+            line.set_data(xx, yy)
+        return (line,)
 
-    ani = animation.FuncAnimation(
-        fig, animate, init_func=init,
-        frames=int(frames), interval=int(interval_ms), blit=True
-    )
+    ani = animation.FuncAnimation(fig, animate, init_func=init, frames=int(frames),
+                                  interval=1000 // max(1, int(fps)), blit=True)
 
-    # Save to a temporary file (Pillow writer), then read bytes
-    from matplotlib.animation import PillowWriter
+    # Save to a temporary GIF and return bytes
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
@@ -321,21 +435,17 @@ def build_heat_conduction_gif(frames=120, fps=15, interval_ms=100, L=10.0, N=400
         with open(tmp_path, "rb") as f:
             data = f.read()
     finally:
-        try:
-            plt.close(fig)
-        except Exception:
-            pass
+        try: plt.close(fig)
+        except Exception: pass
         if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+            try: os.remove(tmp_path)
+            except Exception: pass
 
     return data
 
 
 # =========================
-# S3 Upload
+# S3 upload
 # =========================
 def s3_upload_bytes(data: bytes, key: str, content_type: str = "image/gif") -> Optional[str]:
     if boto3 is None:
@@ -355,124 +465,114 @@ def s3_upload_bytes(data: bytes, key: str, content_type: str = "image/gif") -> O
         Bucket=bucket,
         Key=key,
         Body=data,
-        ContentType=content_type,
         ACL="public-read",
-        CacheControl="max-age=31536000",
+        ContentType=content_type,
+        CacheControl="public, max-age=31536000",
+        ContentDisposition="inline",
     )
-    # Prefer CDN if configured
     cdn = AWS_CFG.get("cdn_media") or AWS_CFG.get("cdn_html")
     if cdn:
         if not cdn.endswith("/"):
             cdn += "/"
         return cdn + key
-    # Default public S3 URL
     region = AWS_CFG.get("region", "us-east-1")
     return f"https://{bucket}.s3.{region}.amazonaws.com/{key}"
 
 
 # =========================
-# Layout: Two columns
+# Actions
 # =========================
-left, right = st.columns([1, 1])
-
-# ---- Left: Static Graph (PNG) ----
 with left:
-    st.subheader("Prompt → Static Graph (PNG)")
-    prompt = st.text_area(
-        "Describe the function to plot",
-        value="Plot y = x^2 - 1 from -5 to 5",
-        height=120,
-    )
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        override_xmin = st.text_input("x_min (optional)")
-    with c2:
-        override_xmax = st.text_input("x_max (optional)")
-    with c3:
-        n_points = st.number_input("points", min_value=200, max_value=5000, value=1000, step=100)
-
     if st.button("Create Graph (PNG)", use_container_width=True):
-        if not prompt.strip():
+        if not prompt_png.strip():
             st.error("Please enter a prompt.")
             st.stop()
 
-        ext = get_azure_extraction(prompt) if use_gpt else None
+        ext = extract_with_gpt(prompt_png) if use_gpt else None
         if ext is None:
-            ext = extract_with_regex(prompt)
+            ext = extract_with_regex(prompt_png)
 
         if not ext.equation:
-            st.error("Couldn't find an equation to plot. Try 'Plot y = sin(x) from -2π to 2π'.")
+            st.error("Couldn't find an equation. Try 'Plot y = sin(x) from -2π to 2π'.")
             st.stop()
 
         def _try_float(s: Optional[str]) -> Optional[float]:
-            if s is None or str(s).strip() == "":
-                return None
-            try:
-                return float(str(s).strip())
-            except Exception:
-                return None
+            if s is None or str(s).strip() == "": return None
+            try: return float(str(s).strip())
+            except Exception: return None
 
-        x_min = _try_float(override_xmin) or ext.x_min or -10.0
-        x_max = _try_float(override_xmax) or ext.x_max or 10.0
+        x_min = _try_float(override_xmin_png) or ext.x_min or -10.0
+        x_max = _try_float(override_xmax_png) or ext.x_max or  10.0
+
+        if (x_max - x_min) > 1e6:
+            st.error("x-range too large. Pick a smaller interval.")
+            st.stop()
 
         try:
-            png_buf = render_static_plot_png(ext.equation, x_min, x_max, int(n_points))
-            st.success(f"Equation: {ext.equation}  •  Range: [{x_min}, {x_max}]  •  Source: {ext.source}")
+            png_buf = render_static_plot_png(ext.equation, x_min, x_max, int(points))
+            st.success(f"Equation: {ext.equation}  •  x ∈ [{x_min}, {x_max}]  •  Source: {ext.source}")
+            st.caption(f"Evaluated: `{to_numpy_expr(ext.equation)}`")
             st.image(png_buf, caption=f"Graph of {ext.equation}", use_container_width=True)
-            st.download_button(
-                "⬇️ Download PNG",
-                data=png_buf,
-                file_name="graph.png",
-                mime="image/png",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ Download PNG", data=png_buf, file_name="graph.png",
+                               mime="image/png", use_container_width=True)
         except Exception as e:
             st.exception(e)
 
-# ---- Right: Heat Conduction GIF + S3 ----
 with right:
-    st.subheader("Heat Conduction: GIF → S3")
-    st.caption("Generates the same animation as your Colab (Fourier vs. Non-Fourier) and uploads to S3.")
+    if st.button("Create GIF (from prompt)", use_container_width=True):
+        if not prompt_gif.strip():
+            st.error("Please enter a prompt.")
+            st.stop()
 
-    if st.button("Create GIF & Upload to S3", use_container_width=True):
-        with st.spinner("Rendering GIF..."):
-            gif_bytes = build_heat_conduction_gif(
-                frames=int(frames),
-                fps=int(fps),
-                interval_ms=int(interval_ms),
-                D=float(D),
-                speed=float(speed),
-                wavelength=float(wavelength),
-                sigma2=float(sigma2),
-            )
+        ext = extract_with_gpt(prompt_gif) if use_gpt else None
+        if ext is None:
+            ext = extract_with_regex(prompt_gif)
 
-        st.image(gif_bytes, caption="Heat Conduction Comparison (GIF)", use_container_width=True)
-        st.download_button(
-            "⬇️ Download GIF",
-            data=gif_bytes,
-            file_name="heat_conduction_comparison.gif",
-            mime="image/gif",
-            use_container_width=True,
-        )
+        if not ext.equation:
+            st.error("Couldn't find an equation to animate. Try “animate y = sin(x - 0.5 t) …”.")
+            st.stop()
 
-        # Upload to S3
-        prefix = AWS_CFG.get("prefix") or "media"
-        key = f"{prefix}/heat_conduction_{int(time.time())}.gif"
-        with st.spinner(f"Uploading to s3://{AWS_CFG.get('bucket')}/{key}"):
-            try:
-                url = s3_upload_bytes(gif_bytes, key, content_type="image/gif")
+        def _try_float(s: Optional[str]) -> Optional[float]:
+            if s is None or str(s).strip() == "": return None
+            try: return float(str(s).strip())
+            except Exception: return None
+
+        x_min = _try_float(override_xmin_gif) or ext.x_min or -2*np.pi
+        x_max = _try_float(override_xmax_gif) or ext.x_max or  2*np.pi
+        t_min = _try_float(override_tmin)     or ext.t_min
+        t_max = _try_float(override_tmax)     or ext.t_max
+
+        if (x_max - x_min) > 1e6:
+            st.error("x-range too large. Pick a smaller interval.")
+            st.stop()
+
+        try:
+            gif_bytes = build_prompt_gif(ext.equation, float(x_min), float(x_max),
+                                         int(points), int(frames), int(fps),
+                                         t_min, t_max)
+            st.success(f"Equation: {ext.equation}  •  x ∈ [{x_min}, {x_max}]"
+                       + (f"  •  t ∈ [{t_min}, {t_max}]" if t_min is not None and t_max is not None else "")
+                       + f"  •  Source: {ext.source}")
+            st.caption(f"Evaluated: `{to_numpy_expr(ext.equation)}`")
+            st.image(gif_bytes, caption="Animated GIF", use_container_width=True)
+            st.download_button("⬇️ Download GIF", data=gif_bytes, file_name="graph.gif",
+                               mime="image/gif", use_container_width=True)
+
+            if want_upload:
+                key = f"{AWS_CFG.get('prefix') or 'media'}/graph_{int(time.time())}.gif"
+                with st.spinner(f"Uploading to s3://{AWS_CFG.get('bucket')}/{key}"):
+                    url = s3_upload_bytes(gif_bytes, key, content_type="image/gif")
                 if url:
                     st.success("Uploaded to S3!")
-                    st.write("Public URL:")
                     st.code(url)
-            except Exception as e:
-                st.exception(e)
+                    st.link_button("Open GIF", url)
+        except Exception as e:
+            st.exception(e)
 
 
-# Footer / help
-st.caption("This app reads all credentials from `.streamlit/secrets.toml` — nothing is hard-coded.")
-with st.expander("Example .streamlit/secrets.toml"):
+# Footer
+st.caption("All credentials are read from `.streamlit/secrets.toml`. Azure is optional; regex fallback is built-in.")
+with st.expander("Example secrets.toml"):
     st.code(
         """# Azure OpenAI (optional)
 AZURE_API_KEY="YOUR_API_KEY"
@@ -480,17 +580,15 @@ AZURE_ENDPOINT="https://YOUR-RESOURCE-NAME.cognitiveservices.azure.com"
 AZURE_DEPLOYMENT="gpt-5-chat"
 AZURE_API_VERSION="2025-01-01-preview"
 
-# AWS / S3
+# AWS / S3 (optional for uploads)
 AWS_ACCESS_KEY="YOUR_AWS_ACCESS_KEY_ID"
 AWS_SECRET_KEY="YOUR_AWS_SECRET_ACCESS_KEY"
 AWS_REGION="ap-south-1"
 AWS_BUCKET="suvichaarapp"
 S3_PREFIX="media"
 
-# CDN (optional)
+# Optional CDN
 CDN_PREFIX_MEDIA="https://media.suvichaar.org/"
-# or
-CDN_HTML_BASE="https://stories.suvichaar.org/"
 """,
         language="toml",
     )
